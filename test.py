@@ -45,6 +45,8 @@ def generate_signals(data, ema_periods, timeframe='H4'):
     for i in range(len(data)):
         trend = check_trend(data.iloc[:i+1], ema_periods)
         bollinger_pos = check_bollinger_position(data.iloc[:i+1])
+        signals.append(bollinger_pos)
+        signals.append(trend)
         if trend == 1 and bollinger_pos == 'near_lower_band':
             signals.append('buy')
         elif trend == -1 and bollinger_pos == 'near_upper_band':
@@ -72,8 +74,10 @@ daily_trend = check_trend(data_daily, ema_periods)
 # 生成交易信号
 data_h4 = generate_signals(data_h4, ema_periods)
 
+data_h4.to_csv('trading_signals.csv')
+
 # 打印交易信号
-print(data_h4[['close', 'signal']].tail(20))
+print(data_h4[['close', 'signal']].tail(500))
 
 # 断开连接
 mt5.shutdown()
