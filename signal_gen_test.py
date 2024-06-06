@@ -1,115 +1,111 @@
+import time
 import MetaTrader5 as mt5
 import pandas as pd
-import numpy as np
-import talib
-from scipy.stats import linregress
-import time
+from take_order import *
+from datetime import datetime
 
-# 连接到MetaTrader 5
+# 定义账号、服务器和密码
+account = 82680726
+password = "Wu@vWgF5"
+server = "MetaQuotes-Demo"
+
+
+# 初始化MetaTrader 5
 if not mt5.initialize():
     print("初始化失败")
     mt5.shutdown()
 
-# 获取历史数据函数
-def get_data(symbol, timeframe, bars=1000):
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
-    data = pd.DataFrame(rates)
-    data['time'] = pd.to_datetime(data['time'], unit='s')
-    data.set_index('time', inplace=True)
+# 登录到交易账户
+if not mt5.login(account, password, server):
+    print("登录失败")
+    mt5.shutdown()
+
+# 定义获取市场数据的函数
+def get_market_data(symbol, timeframe, num_bars):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_bars)
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    return df
+
+# 计算EMA
+def calculate_ema(data, periods):
+    return data['close'].ewm(span=periods, adjust=False).mean()
+
+# 计算布林带
+def calculate_bollinger_bands(data, period=20, deviation=2):
+    data['MA'] = data['close'].rolling(window=period).mean()
+    data['BB_up'] = data['MA'] + (data['close'].rolling(window=period).std() * deviation)
+    data['BB_down'] = data['MA'] - (data['close'].rolling(window=period).std() * deviation)
     return data
 
-# 计算EMA和布林带
-def add_indicators(data, ema_periods, boll_period=20, boll_dev=2):
-    for period in ema_periods:
-        data[f'ema_{period}'] = data['close'].ewm(span=period, adjust=False).mean()
-    data['upper_band'], data['middle_band'], data['lower_band'] = talib.BBANDS(data['close'], timeperiod=boll_period, nbdevup=boll_dev, nbdevdn=boll_dev, matype=0)
-    return data
 
-# 判断趋势
-def check_trend(data, ema_periods):
-    slopes = []
-    for period in ema_periods:
-        ema = data[f'ema_{period}'].dropna()  # 移除NaN值
-        if len(ema) > 1:  # 确保有足够的数据点计算斜率
-            slope, intercept, r_value, p_value, std_err = linregress(range(len(ema)), ema)
-            slopes.append(slope)
-        else:
-            slopes.append(0)  # 数据点不足时设为0
-    if all(slope > 0 for slope in slopes):
-        return 1  # 上升趋势
-    elif all(slope < 0 for slope in slopes):
-        return -1  # 下降趋势
+
+# 定义检查并执行交易的函数
+def check_and_trade(symbol, lot):
+    data = get_market_data(symbol, mt5.TIMEFRAME_H4, 100)
+    
+    # 计算EMA和布林带
+    data['EMA10'] = calculate_ema(data, 10)
+    data['EMA20'] = calculate_ema(data, 20)
+    data['EMA30'] = calculate_ema(data, 30)
+    data['EMA40'] = calculate_ema(data, 40)
+    data['EMA50'] = calculate_ema(data, 50)
+    data = calculate_bollinger_bands(data)
+    
+    last_row = data.iloc[-1]
+    
+    positions = mt5.positions_get(symbol=symbol)
+    if len(positions) > 0:
+        current_position = positions[0]
     else:
-        return 0  # 无明显趋势
+        current_position = None
 
-# 判断布林带位置
-def check_bollinger_position(data):
-    if data['close'].iloc[-1] <= data['lower_band'].iloc[-1]:
-        return 'near_lower_band'
-    elif data['close'].iloc[-1] >= data['upper_band'].iloc[-1]:
-        return 'near_upper_band'
-    else:
-        return 'within_bands'
+    action_taken = "No action"
+    
+    if last_row['EMA10'] > last_row['EMA20'] > last_row['EMA30'] > last_row['EMA40'] > last_row['EMA50']:
+        if last_row['close'] <= last_row['BB_down']:
+            if current_position and current_position.type == mt5.ORDER_TYPE_SELL:
+                # 平仓并买入
+                close_position(current_position)
+                place_trade(mt5.ORDER_TYPE_BUY, symbol, lot, last_row['close'], last_row['BB_down'], last_row['BB_up'])
+                action_taken = "Buy"
+            elif not current_position:
+                # 买入
+                place_trade(mt5.ORDER_TYPE_BUY, symbol, lot, last_row['close'], last_row['BB_down'], last_row['BB_up'])
+                action_taken = "Buy"
+    
+    elif last_row['EMA10'] < last_row['EMA20'] < last_row['EMA30'] < last_row['EMA40'] < last_row['EMA50']:
+        if last_row['close'] >= last_row['BB_up']:
+            if current_position and current_position.type == mt5.ORDER_TYPE_BUY:
+                # 平仓并卖出
+                close_position(current_position)
+                place_trade(mt5.ORDER_TYPE_SELL, symbol, lot, last_row['close'], last_row['BB_up'], last_row['BB_down'])
+                action_taken = "Sell"
+            elif not current_position:
+                # 卖出
+                place_trade(mt5.ORDER_TYPE_SELL, symbol, lot, last_row['close'], last_row['BB_up'], last_row['BB_down'])
+                action_taken = "Sell"
+    
+    # 检查止损
+    if current_position:
+        if current_position.type == mt5.ORDER_TYPE_BUY and last_row['close'] < current_position.price_open:
+            close_position(current_position)
+            action_taken = "Close Buy"
+        elif current_position.type == mt5.ORDER_TYPE_SELL and last_row['close'] > current_position.price_open:
+            close_position(current_position)
+            action_taken = "Close Sell"
 
-# 生成交易信号
-def generate_signals(data, ema_periods):
-    signals = []
-    bolling_poses = []
-    trends = []
-    for i in range(len(data)):
-        trend = check_trend(data.iloc[:i+1], ema_periods)
-        bollinger_pos = check_bollinger_position(data.iloc[:i+1])
-        bolling_poses.append(bollinger_pos)
-        trends.append(trend)
-        if trend == 1 and bollinger_pos == 'near_lower_band':
-            signals.append('buy')
-        elif trend == -1 and bollinger_pos == 'near_upper_band':
-            signals.append('sell')
-        else:
-            signals.append('hold')
-    data['signal'] = signals
-    data['bolling_pos'] = bolling_poses
-    data['trend'] = trends
-    return data
+    print(f"Time: {datetime.now()}, Action: {action_taken}")
 
-# 实时监控并处理ticks数据
-def monitor_ticks(symbol, ema_periods):
-    tick_data = []
 
+
+# 运行策略
+symbol = "EURUSD"
+lot = 0.1
+
+try:
     while True:
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            print("获取tick失败")
-            continue
-        
-        tick_data.append([tick.time, tick.bid, tick.ask])
-        df_ticks = pd.DataFrame(tick_data, columns=['time', 'bid', 'ask'])
-        df_ticks['time'] = pd.to_datetime(df_ticks['time'], unit='s')
-        df_ticks.set_index('time', inplace=True)
-        
-        if len(df_ticks) > 1000:  # 保持最近1000条ticks数据
-            df_ticks = df_ticks.iloc[-1000:]
-        
-        close_prices = (df_ticks['bid'] + df_ticks['ask']) / 2
-        df_ticks['close'] = close_prices
-
-        df_ticks = add_indicators(df_ticks, ema_periods)
-        df_ticks = generate_signals(df_ticks, ema_periods)
-
-        print(df_ticks[['close', 'signal']].tail(1))
-
-        # 保存实时数据到CSV
-        df_ticks.to_csv('real_time_ticks.csv')
-
-        time.sleep(1)  # 每秒钟检查一次新的tick数据
-
-# 运行信号生成器
-def signal_gen():
-    symbol = "EURUSD"
-    ema_periods = [10, 20, 30, 40, 50]
-    monitor_ticks(symbol, ema_periods)
-
-signal_gen()
-
-# 断开连接
-mt5.shutdown()
+        check_and_trade(symbol, lot)
+        time.sleep(1)
+finally:
+    mt5.shutdown()
